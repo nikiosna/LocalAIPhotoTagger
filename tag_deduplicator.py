@@ -22,9 +22,10 @@ logger = logging.getLogger(__name__)
 class TagDeduplicator:
     """Main class for deduplicating similar tags across images."""
 
-    def __init__(self, api_url: str = "http://127.0.0.1:1234", model: str = "qwen/qwen3-8b"):
+    def __init__(self, api_url: str = "http://127.0.0.1:1234", model: str = "qwen/qwen3-8b", use_chunking: bool = False):
         self.api_url = api_url
         self.model = model
+        self.use_chunking = use_chunking  # Split tags alphabetically by starting character
         # Supported image formats (same as image_tagger.py)
         self.supported_formats = {'.jpg', '.jpeg', '.tiff', '.tif', '.png', '.bmp', '.webp'}
         
@@ -154,11 +155,43 @@ Here are the tags to deduplicate:"""
         logger.info(f"Collected {len(all_tags)} unique tags from {len(image_files)} images")
         return dict(tag_to_files), all_tags
 
+    def chunk_tags_alphabetically(self, tags: Set[str]) -> Dict[str, List[str]]:
+        """Split tags into chunks based on their starting character (A, B, C, etc.)."""
+        chunks: Dict[str, List[str]] = {}
+        
+        for tag in tags:
+            # Get the first character and convert to uppercase
+            first_char = tag[0].upper() if tag else 'OTHER'
+            
+            # Group by alphabetic character, put non-alphabetic in 'OTHER'
+            if first_char.isalpha():
+                chunk_key = first_char
+            else:
+                chunk_key = 'OTHER'
+            
+            if chunk_key not in chunks:
+                chunks[chunk_key] = []
+            chunks[chunk_key].append(tag)
+        
+        # Sort tags within each chunk
+        for chunk_key in chunks:
+            chunks[chunk_key].sort()
+        
+        return chunks
+
     def get_ai_deduplication_mapping(self, tags: Set[str], dry_run: bool = False) -> Optional[Dict[str, str]]:
         """Call the AI model to get tag deduplication mapping."""
         if not tags:
             return {}
-            
+        
+        # If chunking is enabled, process tags in alphabetical chunks
+        if self.use_chunking:
+            return self.get_ai_deduplication_mapping_chunked(tags, dry_run)
+        else:
+            return self.get_ai_deduplication_mapping_single(tags, dry_run)
+
+    def get_ai_deduplication_mapping_single(self, tags: Set[str], dry_run: bool = False) -> Optional[Dict[str, str]]:
+        """Process all tags in a single AI request (original behavior)."""
         try:
             tags_list = sorted(list(tags))
             tags_text = "\n".join([f"- {tag}" for tag in tags_list])
@@ -195,51 +228,7 @@ Here are the tags to deduplicate:"""
                 timeout=120
             )
 
-            if response.status_code == 200:
-                result = response.json()
-                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-                
-                try:
-                    # Clean the response more thoroughly
-                    content = content.strip()
-                    
-                    # Remove thinking tags if present
-                    if '<think>' in content:
-                        # Extract content between </think> and end, or find JSON block
-                        think_end = content.find('</think>')
-                        if think_end != -1:
-                            content = content[think_end + 8:].strip()
-                    
-                    # Remove code blocks
-                    if content.startswith('```json'):
-                        content = content[7:]
-                    elif content.startswith('```'):
-                        content = content[3:]
-                    if content.endswith('```'):
-                        content = content[:-3]
-                    content = content.strip()
-                    
-                    # Try to find JSON object in the content
-                    json_start = content.find('{')
-                    json_end = content.rfind('}')
-                    if json_start != -1 and json_end != -1 and json_end > json_start:
-                        content = content[json_start:json_end + 1]
-                    
-                    mapping = json.loads(content)
-                    if isinstance(mapping, dict):
-                        logger.info(f"AI suggested {len(mapping)} tag changes")
-                        return mapping
-                    else:
-                        logger.error("AI response is not a valid dictionary")
-                        return None
-                        
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse AI response: {e}")
-                    logger.debug(f"Raw content: {content}")
-                    return None
-            else:
-                logger.error(f"AI API request failed: {response.status_code} - {response.text}")
-                return None
+            return self.parse_ai_response(response, tags)
 
         except requests.exceptions.Timeout:
             logger.error("AI API request timed out")
@@ -249,6 +238,85 @@ Here are the tags to deduplicate:"""
             return None
         except Exception as e:
             logger.error(f"Error calling AI model: {e}")
+            return None
+
+    def get_ai_deduplication_mapping_chunked(self, tags: Set[str], dry_run: bool = False) -> Optional[Dict[str, str]]:
+        """Process tags in alphabetical chunks for large datasets."""
+        logger.info(f"Processing {len(tags)} tags in alphabetical chunks...")
+        
+        # Split tags into alphabetical chunks
+        chunks = self.chunk_tags_alphabetically(tags)
+        logger.info(f"Split tags into {len(chunks)} alphabetical chunks: {sorted(chunks.keys())}")
+        
+        combined_mapping = {}
+        
+        for chunk_key in sorted(chunks.keys()):
+            chunk_tags = chunks[chunk_key]
+            logger.info(f"Processing chunk '{chunk_key}' with {len(chunk_tags)} tags...")
+            
+            try:
+                chunk_mapping = self.get_ai_deduplication_mapping_single(set(chunk_tags), dry_run)
+                
+                if chunk_mapping is None:
+                    logger.error(f"Failed to process chunk '{chunk_key}', skipping...")
+                    continue
+                
+                # Merge the chunk mapping into the combined mapping
+                combined_mapping.update(chunk_mapping)
+                logger.info(f"Chunk '{chunk_key}' suggested {len(chunk_mapping)} tag changes")
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk '{chunk_key}': {e}")
+                continue
+        
+        logger.info(f"Combined chunked processing: {len(combined_mapping)} total tag changes suggested")
+        return combined_mapping
+
+    def parse_ai_response(self, response, tags: Set[str]) -> Optional[Dict[str, str]]:
+        """Parse the AI response and extract the tag mapping."""
+        if response.status_code == 200:
+            result = response.json()
+            content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+            
+            try:
+                # Clean the response more thoroughly
+                content = content.strip()
+                
+                # Remove thinking tags if present
+                if '<think>' in content:
+                    # Extract content between </think> and end, or find JSON block
+                    think_end = content.find('</think>')
+                    if think_end != -1:
+                        content = content[think_end + 8:].strip()
+                
+                # Remove code blocks
+                if content.startswith('```json'):
+                    content = content[7:]
+                elif content.startswith('```'):
+                    content = content[3:]
+                if content.endswith('```'):
+                    content = content[:-3]
+                content = content.strip()
+                
+                # Try to find JSON object in the content
+                json_start = content.find('{')
+                json_end = content.rfind('}')
+                if json_start != -1 and json_end != -1 and json_end > json_start:
+                    content = content[json_start:json_end + 1]
+                
+                mapping = json.loads(content)
+                if isinstance(mapping, dict):
+                    return mapping
+                else:
+                    logger.error("AI response is not a valid dictionary")
+                    return None
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse AI response: {e}")
+                logger.debug(f"Raw content: {content}")
+                return None
+        else:
+            logger.error(f"AI API request failed: {response.status_code} - {response.text}")
             return None
 
     def apply_tag_changes(self, input_dir: Path, tag_mapping: Dict[str, str], tag_to_files: Dict[str, Set[str]]) -> Dict[str, int]:
@@ -365,9 +433,15 @@ Here are the tags to deduplicate:"""
             logger.warning("No tag changes suggested by AI or AI call failed.")
             return False
         
-        if not tag_mapping:
+        # Filter out no-op changes where old_tag == new_tag
+        filtered_mapping = {old_tag: new_tag for old_tag, new_tag in tag_mapping.items() if old_tag != new_tag}
+        
+        if not filtered_mapping:
             logger.info("No duplicate tags found. All tags are already unique.")
             return True
+        
+        # Update tag_mapping to use the filtered version
+        tag_mapping = filtered_mapping
         
         # Display proposed changes
         logger.info("Proposed tag changes:")
@@ -402,6 +476,7 @@ def main():
     parser.add_argument("--api-url", default="http://127.0.0.1:1234", help="AI model API URL.")
     parser.add_argument("--model", default="qwen/qwen3-8b", help="AI model name for deduplication.")
     parser.add_argument("--dry-run", action="store_true", help="Show proposed changes without applying them.")
+    parser.add_argument("--chunk", action="store_true", help="Split tags alphabetically into chunks for large datasets (A, B, C, etc.).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     
     args = parser.parse_args()
@@ -409,7 +484,7 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         
-    deduplicator = TagDeduplicator(api_url=args.api_url, model=args.model)
+    deduplicator = TagDeduplicator(api_url=args.api_url, model=args.model, use_chunking=args.chunk)
     input_path = Path(args.input_dir)
     
     if not input_path.is_dir():
