@@ -70,18 +70,16 @@ python tag_deduplicator.py <path_to_your_images>
 python tag_deduplicator.py <path_to_your_images> --dry-run
 ```
 
-## Recommended Models
+## Recommended Software
+
+A recommended setup is using [LM Studio](https://lmstudio.ai/) to run the local AI models.
 
 The following models are the current defaults and serve as good starting points:
 
 -   **Tagging (Vision-Language-Model)**: [google/gemma-3-4b](https://lmstudio.ai/models/google/gemma-3-4b)
 -   **Tag Deduplication**: [deepseek/deepseek-r1-0528-qwen3-8b](https://lmstudio.ai/models/deepseek/deepseek-r1-0528-qwen3-8b)
 
-## Example Workflow
-
-A recommended setup is using [LM Studio](https://lmstudio.ai/) to run the local AI models.
-
-For viewing and managing tagged photos on Android, [F-Stop Gallery](https://play.google.com/store/apps/details?id=com.fstop.photo) is used.
+For viewing and managing tagged photos on Android, [Aves Gallery](https://github.com/deckerst/aves) is a great open-source option. [F-Stop Gallery](https://play.google.com/store/apps/details?id=com.fstop.photo) is another alternative.
 
 **Note on F-Stop:** I'm not fully satisfied with F-Stop. To make newly changed tags visible, it's often necessary to rename the folder containing the images and then rename it back. Simply clearing the app cache does not seem to be sufficient to force a metadata refresh.
 
