@@ -8,7 +8,7 @@ The scripts are designed to work with any local AI model that is compatible with
 
 -   **Image Classification**: Automatically renames image files based on their content and generates a JSON file with a title, description, and keywords.
 -   **AI-Powered Tagging**: Generates relevant tags for images and writes them to XMP and EXIF metadata.
--   **Tag Deduplication**: Scans the entire library for similar or duplicate tags (e.g., "cat" vs "cats") and intelligently merges them.
+-   **Advanced Tag Deduplication**: Uses embedding-based semantic similarity to identify and merge similar tags (e.g., "Forest" → "Nature", "Outdoors" → "Outdoor") with intelligent clustering and representative tag selection.
 -   **Recursive Processing**: Scripts can process images in nested subdirectories.
 -   **Metadata Focused**: Writes tags directly to image files (XMP and EXIF), ensuring compatibility with photo management software like Adobe Lightroom or digiKam.
 
@@ -17,6 +17,8 @@ The scripts are designed to work with any local AI model that is compatible with
 -   Python 3.7+
 -   A running local AI model server (e.g., LM Studio) that exposes an OpenAI-compatible API endpoint.
 -   `exiftool` must be installed and available in your system's PATH. You can install it from the [official website](https://exiftool.org/install.html).
+-   **For tag deduplication**: An embedding model (e.g., nomic-embed-text-v1.5) running on your local AI server.
+-   **Python packages**: `numpy`, `scikit-learn`, `requests` (install with `pip install numpy scikit-learn requests`)
 
 ## Scripts
 
@@ -53,12 +55,21 @@ python image_tagger.py <path_to_your_images> --append-tags
 
 ### 3. `tag_deduplicator.py`
 
-Over time, AI-generated tags can become inconsistent (e.g., "Dslr", "DSLR", "Digital SLR"). This script solves that problem by:
+Over time, AI-generated tags can become inconsistent (e.g., "Dslr", "DSLR", "Digital SLR") or semantically similar but differently worded (e.g., "Forest", "Woodland", "Trees"). This script solves that problem using advanced embedding-based semantic similarity analysis:
 
 1.  Scanning all images in a directory and collecting every unique tag.
-2.  Sending the list of unique tags to an AI model to get a "deduplication map" (e.g., `{"Dslr": "DSLR", "Digital SLR": "DSLR"}`).
-3.  Applying these corrections to the XMP metadata of all affected images.
-4.  Generating a `tag_deduplication_report.json` file with a summary of the changes.
+2.  Using text embeddings to calculate semantic similarity between tags.
+3.  Clustering similar tags using DBSCAN algorithm based on cosine similarity.
+4.  Automatically selecting the best representative tag for each cluster (based on frequency, length, and alphabetical order).
+5.  Applying these corrections to the XMP metadata of all affected images.
+6.  Generating a detailed `tag_deduplication_report_embedding.json` file with comprehensive analysis.
+
+**Key Features:**
+- **Semantic Understanding**: Uses text embeddings to identify semantically similar tags, not just exact matches
+- **Configurable Similarity**: Adjustable similarity threshold for fine-tuning clustering sensitivity
+- **Intelligent Selection**: Chooses the most appropriate representative tag based on usage frequency and other criteria
+- **Robust Processing**: Handles edge cases and validates embeddings for reliable operation
+- **Comprehensive Reporting**: Detailed reports showing clusters, frequencies, and affected files
 
 **Usage:**
 
@@ -68,7 +79,20 @@ python tag_deduplicator.py <path_to_your_images>
 
 # See proposed changes without applying them
 python tag_deduplicator.py <path_to_your_images> --dry-run
+
+# Adjust similarity threshold (0.0-1.0, default: 0.85)
+python tag_deduplicator.py <path_to_your_images> --similarity-threshold 0.9
+
+# Configure embedding model and API
+python tag_deduplicator.py <path_to_your_images> --embedding-url http://localhost:1234 --embedding-model text-embedding-nomic-embed-text-v1.5
 ```
+
+**Additional Options:**
+- `--similarity-threshold`: Cosine similarity threshold for grouping tags (0.0-1.0, default: 0.85)
+- `--min-cluster-size`: Minimum number of tags required to form a cluster (default: 2)
+- `--batch-size`: Number of tags to process in each embedding batch (default: 100)
+- `--embedding-url`: URL for the embedding API (default: http://localhost:1234)
+- `--embedding-model`: Name of the embedding model to use (default: text-embedding-nomic-embed-text-v1.5)
 
 ## Recommended Software
 
@@ -77,7 +101,8 @@ A recommended setup is using [LM Studio](https://lmstudio.ai/) to run the local 
 The following models are the current defaults and serve as good starting points:
 
 -   **Tagging (Vision-Language-Model)**: [google/gemma-3-4b](https://lmstudio.ai/models/google/gemma-3-4b)
--   **Tag Deduplication**: [deepseek/deepseek-r1-0528-qwen3-8b](https://lmstudio.ai/models/deepseek/deepseek-r1-0528-qwen3-8b)
+-   **Tag Deduplication (Embedding Model)**: [nomic-ai/nomic-embed-text-v1.5-GGUF](https://lmstudio.ai/models/nomic-ai/nomic-embed-text-v1.5-GGUF) - Required for semantic similarity analysis
+-   **Legacy Tag Deduplication**: [deepseek/deepseek-r1-0528-qwen3-8b](https://lmstudio.ai/models/deepseek/deepseek-r1-0528-qwen3-8b) - No longer used but kept for reference
 
 For viewing and managing tagged photos on Android, [Aves Gallery](https://github.com/deckerst/aves) is a great open-source option. [F-Stop Gallery](https://play.google.com/store/apps/details?id=com.fstop.photo) is another alternative.
 

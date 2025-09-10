@@ -1,59 +1,299 @@
 #!/usr/bin/env python3
 """
-Tag Deduplicator Script
+Embedding-Based Tag Deduplicator Script
 
-This script collects all tags from images in a directory, uses AI to deduplicate
-similar tags, and applies the changes back to all images.
+This script uses text embeddings to identify semantically similar tags across images
+and automatically deduplicate them based on configurable similarity thresholds.
 """
 
 import json
 import requests
 import argparse
 import subprocess
+import numpy as np
 from pathlib import Path
-from typing import List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Set, Optional, Tuple, Any
 import logging
-from collections import defaultdict
+from collections import defaultdict, Counter
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_similarity
+import itertools
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class TagDeduplicator:
-    """Main class for deduplicating similar tags across images."""
+class EmbeddingTagDeduplicator:
+    """Advanced tag deduplicator using text embeddings for semantic similarity."""
 
-    def __init__(self, api_url: str = "http://127.0.0.1:1234", model: str = "qwen/qwen3-8b", use_chunking: bool = False):
-        self.api_url = api_url
-        self.model = model
-        self.use_chunking = use_chunking  # Split tags alphabetically by starting character
-        # Supported image formats (same as image_tagger.py)
+    def __init__(self, 
+                 embedding_api_url: str = "http://localhost:1234",
+                 embedding_model: str = "text-embedding-nomic-embed-text-v1.5",
+                 similarity_threshold: float = 0.2,
+                 min_cluster_size: int = 2,
+                 batch_size: int = 100):
+        """
+        Initialize the embedding-based tag deduplicator.
+        
+        Args:
+            embedding_api_url: URL for the embedding API
+            embedding_model: Name of the embedding model to use
+            similarity_threshold: Cosine similarity threshold for grouping tags (0.0-1.0)
+            min_cluster_size: Minimum number of tags required to form a cluster
+            batch_size: Number of tags to process in each embedding batch
+        """
+        self.embedding_api_url = embedding_api_url
+        self.embedding_model = embedding_model
+        self.similarity_threshold = similarity_threshold
+        self.min_cluster_size = min_cluster_size
+        self.batch_size = batch_size
+        
+        # Supported image formats
         self.supported_formats = {'.jpg', '.jpeg', '.tiff', '.tif', '.png', '.bmp', '.webp'}
         
-        # Configuration for AI model behavior
-        self.ADD_NOTHINK_TO_PROMPT = True
+        # Cache for embeddings to avoid recomputation
+        self.embedding_cache: Dict[str, np.ndarray] = {}
         
-        # AI prompt for tag deduplication
-        self.deduplication_prompt = """You are a tag deduplication expert. I will provide you with a list of tags used across multiple images. Your task is to identify similar or duplicate tags and create a mapping to deduplicate them.
+        logger.info(f"Initialized EmbeddingTagDeduplicator with similarity threshold: {similarity_threshold}")
 
-Rules:
-1. Group similar tags that refer to the same concept (e.g., "Portrait" and "Portraits", "Landscape" and "Landscapes")
-2. Prefer more specific and descriptive tags over generic ones
-3. Maintain consistent capitalization (Title Case)
-4. Keep technical and domain-specific terms precise
-5. Only merge tags that are truly similar in meaning
-6. Consider variations in spelling, hyphenation, and pluralization
-7. Merge synonymous terms (e.g., "Automobile" and "Car", "Building" and "Architecture")
+    def get_embeddings(self, texts: List[str]) -> List[np.ndarray]:
+        """
+        Get embeddings for a list of texts, using cache when possible.
+        
+        Args:
+            texts: List of text strings to embed
+            
+        Returns:
+            List of embedding vectors as numpy arrays
+        """
+        # Check cache first
+        cached_embeddings = []
+        uncached_texts = []
+        uncached_indices = []
+        
+        for i, text in enumerate(texts):
+            if text in self.embedding_cache:
+                cached_embeddings.append((i, self.embedding_cache[text]))
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+        
+        # Get embeddings for uncached texts
+        new_embeddings = []
+        if uncached_texts:
+            try:
+                logger.debug(f"Getting embeddings for {len(uncached_texts)} new texts")
+                url = f"{self.embedding_api_url}/v1/embeddings"
+                response = requests.post(
+                    url,
+                    json={
+                        "model": self.embedding_model,
+                        "input": uncached_texts
+                    },
+                    timeout=60
+                )
+                response.raise_for_status()
+                
+                embedding_data = response.json()["data"]
+                for i, data in enumerate(embedding_data):
+                    embedding = np.array(data["embedding"])
+                    
+                    # Validate embedding
+                    if len(embedding) == 0:
+                        logger.error(f"Received empty embedding for text: '{uncached_texts[i]}'")
+                        raise ValueError(f"Empty embedding received for text: '{uncached_texts[i]}'")
+                    
+                    if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+                        logger.error(f"Received invalid embedding (NaN/inf) for text: '{uncached_texts[i]}'")
+                        raise ValueError(f"Invalid embedding (NaN/inf) received for text: '{uncached_texts[i]}'")
+                    
+                    text = uncached_texts[i]
+                    # Cache the embedding
+                    self.embedding_cache[text] = embedding
+                    new_embeddings.append((uncached_indices[i], embedding))
+                    
+            except Exception as e:
+                logger.error(f"Failed to get embeddings: {e}")
+                raise
+        
+        # Combine cached and new embeddings in correct order
+        all_embeddings = cached_embeddings + new_embeddings
+        all_embeddings.sort(key=lambda x: x[0])  # Sort by original index
+        
+        return [embedding for _, embedding in all_embeddings]
 
-Please respond with a JSON object where each key is an "old tag" and each value is the "new tag" it should be renamed to. Only include tags that need to be changed - don't include tags that should remain unchanged.
+    def calculate_similarity_matrix(self, embeddings: List[np.ndarray]) -> np.ndarray:
+        """
+        Calculate cosine similarity matrix for embeddings.
+        
+        Args:
+            embeddings: List of embedding vectors
+            
+        Returns:
+            Similarity matrix as numpy array
+        """
+        if not embeddings:
+            return np.array([])
+        
+        # Stack embeddings into matrix
+        embedding_matrix = np.vstack(embeddings)
+        
+        # Check for invalid values in embeddings
+        if np.any(np.isnan(embedding_matrix)) or np.any(np.isinf(embedding_matrix)):
+            logger.error("Found NaN or infinite values in embeddings")
+            raise ValueError("Invalid values (NaN or inf) found in embeddings")
+        
+        # Normalize embeddings to ensure valid cosine similarity calculation
+        # This prevents numerical issues with very small or zero-norm vectors
+        norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
+        zero_norm_mask = norms.flatten() == 0
+        
+        if np.any(zero_norm_mask):
+            logger.warning(f"Found {np.sum(zero_norm_mask)} zero-norm embeddings, replacing with small random values")
+            # Replace zero-norm vectors with small random vectors
+            for i in np.where(zero_norm_mask)[0]:
+                embedding_matrix[i] = np.random.normal(0, 1e-8, embedding_matrix.shape[1])
+            # Recalculate norms
+            norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
+        
+        # Normalize embeddings
+        normalized_embeddings = embedding_matrix / norms
+        
+        # Calculate cosine similarity
+        similarity_matrix = cosine_similarity(normalized_embeddings)
+        
+        # Ensure similarity values are in valid range [-1, 1]
+        similarity_matrix = np.clip(similarity_matrix, -1.0, 1.0)
+        
+        # Check for invalid values in similarity matrix
+        if np.any(np.isnan(similarity_matrix)) or np.any(np.isinf(similarity_matrix)):
+            logger.error("Found NaN or infinite values in similarity matrix")
+            raise ValueError("Invalid values (NaN or inf) found in similarity matrix")
+        
+        return similarity_matrix
 
-Example format:
-{
-  "old tag 1": "new tag 1",
-  "old tag 2": "new tag 1",
-  "old tag 3": "new tag 3"
-}
+    def find_similar_tag_clusters(self, tags: List[str], embeddings: List[np.ndarray]) -> List[List[int]]:
+        """
+        Find clusters of similar tags using DBSCAN clustering.
+        
+        Args:
+            tags: List of tag strings
+            embeddings: List of corresponding embedding vectors
+            
+        Returns:
+            List of clusters, where each cluster is a list of tag indices
+        """
+        if len(tags) < self.min_cluster_size:
+            return []
+        
+        # Calculate similarity matrix
+        similarity_matrix = self.calculate_similarity_matrix(embeddings)
+        
+        # Convert similarity to distance (1 - similarity)
+        distance_matrix = 1 - similarity_matrix
+        
+        # Validate distance matrix
+        if np.any(distance_matrix < 0):
+            logger.error("Distance matrix contains negative values")
+            logger.debug(f"Min distance: {np.min(distance_matrix)}, Max distance: {np.max(distance_matrix)}")
+            logger.debug(f"Similarity matrix range: [{np.min(similarity_matrix)}, {np.max(similarity_matrix)}]")
+            raise ValueError("Distance matrix contains negative values")
+        
+        if np.any(np.isnan(distance_matrix)) or np.any(np.isinf(distance_matrix)):
+            logger.error("Distance matrix contains NaN or infinite values")
+            raise ValueError("Distance matrix contains invalid values (NaN or inf)")
+        
+        # Use DBSCAN for clustering
+        # eps is the maximum distance between samples in the same cluster
+        eps = 1 - self.similarity_threshold
+        clustering = DBSCAN(eps=eps, min_samples=self.min_cluster_size, metric='precomputed')
+        cluster_labels = clustering.fit_predict(distance_matrix)
+        
+        # Group indices by cluster label
+        clusters = defaultdict(list)
+        for idx, label in enumerate(cluster_labels):
+            if label != -1:  # -1 indicates noise/outlier
+                clusters[label].append(idx)
+        
+        # Convert to list of clusters
+        cluster_list = [cluster for cluster in clusters.values() if len(cluster) >= self.min_cluster_size]
+        
+        logger.info(f"Found {len(cluster_list)} clusters from {len(tags)} tags")
+        for i, cluster in enumerate(cluster_list):
+            cluster_tags = [tags[idx] for idx in cluster]
+            logger.debug(f"Cluster {i}: {cluster_tags}")
+        
+        return cluster_list
 
-Here are the tags to deduplicate:"""
+    def select_best_representative_tag(self, tag_indices: List[int], tags: List[str], 
+                                     tag_frequencies: Dict[str, int]) -> str:
+        """
+        Select the best representative tag from a cluster.
+        
+        Selection criteria (in order of priority):
+        1. Most frequent tag (appears in most images)
+        2. Shortest tag (more concise)
+        3. Alphabetically first (consistent ordering)
+        
+        Args:
+            tag_indices: Indices of tags in the cluster
+            tags: List of all tags
+            tag_frequencies: Dictionary mapping tags to their frequency counts
+            
+        Returns:
+            The selected representative tag
+        """
+        cluster_tags = [tags[idx] for idx in tag_indices]
+        
+        # Sort by frequency (descending), then by length (ascending), then alphabetically
+        def sort_key(tag):
+            frequency = tag_frequencies.get(tag, 0)
+            return (-frequency, len(tag), tag.lower())
+        
+        sorted_tags = sorted(cluster_tags, key=sort_key)
+        selected_tag = sorted_tags[0]
+        
+        logger.debug(f"Selected '{selected_tag}' as representative from: {cluster_tags}")
+        return selected_tag
+
+    def create_tag_mapping(self, tags: List[str], tag_frequencies: Dict[str, int]) -> Dict[str, str]:
+        """
+        Create a mapping from old tags to new tags based on embedding similarity.
+        
+        Args:
+            tags: List of unique tags
+            tag_frequencies: Dictionary mapping tags to their frequency counts
+            
+        Returns:
+            Dictionary mapping old tags to new representative tags
+        """
+        if not tags:
+            return {}
+        
+        logger.info(f"Creating tag mapping for {len(tags)} unique tags")
+        
+        # Process tags in batches to avoid memory issues
+        all_embeddings = []
+        for i in range(0, len(tags), self.batch_size):
+            batch_tags = tags[i:i + self.batch_size]
+            batch_embeddings = self.get_embeddings(batch_tags)
+            all_embeddings.extend(batch_embeddings)
+        
+        # Find clusters of similar tags
+        clusters = self.find_similar_tag_clusters(tags, all_embeddings)
+        
+        # Create mapping from clusters
+        tag_mapping = {}
+        for cluster in clusters:
+            representative_tag = self.select_best_representative_tag(cluster, tags, tag_frequencies)
+            
+            for tag_idx in cluster:
+                old_tag = tags[tag_idx]
+                if old_tag != representative_tag:
+                    tag_mapping[old_tag] = representative_tag
+        
+        logger.info(f"Created mapping for {len(tag_mapping)} tags into {len(clusters)} clusters")
+        return tag_mapping
 
     def get_existing_xmp_tags(self, image_path: Path) -> List[str]:
         """Read existing XMP Subject tags from an image using exiftool."""
@@ -93,7 +333,7 @@ Here are the tags to deduplicate:"""
                 write_cmd = ['exiftool', '-overwrite_original'] + tag_args + [str(image_path)]
                 subprocess.run(write_cmd, capture_output=True, text=True, check=True)
             
-            logger.info(f"Successfully updated XMP tags for {image_path}")
+            logger.debug(f"Successfully updated XMP tags for {image_path}")
             return True
             
         except subprocess.CalledProcessError as e:
@@ -107,16 +347,18 @@ Here are the tags to deduplicate:"""
         """Check if the file is a supported image format."""
         return file_path.suffix.lower() in self.supported_formats
 
-    def collect_all_tags(self, input_dir: Path) -> Tuple[Dict[str, Set[str]], Set[str]]:
+    def collect_all_tags(self, input_dir: Path) -> Tuple[Dict[str, Set[str]], Dict[str, int]]:
         """
         Collect all tags from all images in the directory.
-        Returns: (tag_to_files_mapping, all_unique_tags)
+        
+        Returns:
+            Tuple of (tag_to_files_mapping, tag_frequencies)
         """
         logger.info(f"Collecting tags from all images in: {input_dir}")
         
         if not input_dir.exists() or not input_dir.is_dir():
             logger.error(f"Invalid input directory: {input_dir}")
-            return {}, set()
+            return {}, {}
         
         # Find all image files recursively
         image_files: List[Path] = []
@@ -131,13 +373,13 @@ Here are the tags to deduplicate:"""
         
         if not image_files:
             logger.warning("No supported image files found.")
-            return {}, set()
+            return {}, {}
 
         logger.info(f"Found {len(image_files)} images to analyze")
         
         # Collect tags from all images
         tag_to_files = defaultdict(set)
-        all_tags = set()
+        tag_counter: Counter[str] = Counter()
         
         for image_path in image_files:
             try:
@@ -146,180 +388,19 @@ Here are the tags to deduplicate:"""
                     logger.debug(f"Found {len(tags)} tags in {image_path}: {tags}")
                     for tag in tags:
                         tag_to_files[tag].add(str(image_path))
-                        all_tags.add(tag)
+                        tag_counter[tag] += 1
                 else:
                     logger.debug(f"No tags found in {image_path}")
             except Exception as e:
                 logger.error(f"Error reading tags from {image_path}: {e}")
         
-        logger.info(f"Collected {len(all_tags)} unique tags from {len(image_files)} images")
-        return dict(tag_to_files), all_tags
-
-    def chunk_tags_alphabetically(self, tags: Set[str]) -> Dict[str, List[str]]:
-        """Split tags into chunks based on their starting character (A, B, C, etc.)."""
-        chunks: Dict[str, List[str]] = {}
+        tag_frequencies = dict(tag_counter)
+        logger.info(f"Collected {len(tag_frequencies)} unique tags from {len(image_files)} images")
         
-        for tag in tags:
-            # Get the first character and convert to uppercase
-            first_char = tag[0].upper() if tag else 'OTHER'
-            
-            # Group by alphabetic character, put non-alphabetic in 'OTHER'
-            if first_char.isalpha():
-                chunk_key = first_char
-            else:
-                chunk_key = 'OTHER'
-            
-            if chunk_key not in chunks:
-                chunks[chunk_key] = []
-            chunks[chunk_key].append(tag)
-        
-        # Sort tags within each chunk
-        for chunk_key in chunks:
-            chunks[chunk_key].sort()
-        
-        return chunks
+        return dict(tag_to_files), tag_frequencies
 
-    def get_ai_deduplication_mapping(self, tags: Set[str], dry_run: bool = False) -> Optional[Dict[str, str]]:
-        """Call the AI model to get tag deduplication mapping."""
-        if not tags:
-            return {}
-        
-        # If chunking is enabled, process tags in alphabetical chunks
-        if self.use_chunking:
-            return self.get_ai_deduplication_mapping_chunked(tags, dry_run)
-        else:
-            return self.get_ai_deduplication_mapping_single(tags, dry_run)
-
-    def get_ai_deduplication_mapping_single(self, tags: Set[str], dry_run: bool = False) -> Optional[Dict[str, str]]:
-        """Process all tags in a single AI request (original behavior)."""
-        try:
-            tags_list = sorted(list(tags))
-            tags_text = "\n".join([f"- {tag}" for tag in tags_list])
-            
-            full_prompt = f"{self.deduplication_prompt}\n\n{tags_text}"
-            
-            # Add /no_think directive if enabled
-            if self.ADD_NOTHINK_TO_PROMPT:
-                full_prompt += "\n\n/no_think"
-            
-            if dry_run:
-                logger.info("AI Prompt being sent:")
-                logger.info('"""')
-                logger.info(full_prompt)
-                logger.info('"""')
-            
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": full_prompt
-                    }
-                ],
-                "max_tokens": 2000,
-                "temperature": 0.1  # Low temperature for consistent results
-            }
-
-            logger.info(f"Sending {len(tags)} tags to AI model for deduplication...")
-            response = requests.post(
-                f"{self.api_url}/v1/chat/completions",
-                headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=120
-            )
-
-            return self.parse_ai_response(response, tags)
-
-        except requests.exceptions.Timeout:
-            logger.error("AI API request timed out")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"AI API request error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Error calling AI model: {e}")
-            return None
-
-    def get_ai_deduplication_mapping_chunked(self, tags: Set[str], dry_run: bool = False) -> Optional[Dict[str, str]]:
-        """Process tags in alphabetical chunks for large datasets."""
-        logger.info(f"Processing {len(tags)} tags in alphabetical chunks...")
-        
-        # Split tags into alphabetical chunks
-        chunks = self.chunk_tags_alphabetically(tags)
-        logger.info(f"Split tags into {len(chunks)} alphabetical chunks: {sorted(chunks.keys())}")
-        
-        combined_mapping = {}
-        
-        for chunk_key in sorted(chunks.keys()):
-            chunk_tags = chunks[chunk_key]
-            logger.info(f"Processing chunk '{chunk_key}' with {len(chunk_tags)} tags...")
-            
-            try:
-                chunk_mapping = self.get_ai_deduplication_mapping_single(set(chunk_tags), dry_run)
-                
-                if chunk_mapping is None:
-                    logger.error(f"Failed to process chunk '{chunk_key}', skipping...")
-                    continue
-                
-                # Merge the chunk mapping into the combined mapping
-                combined_mapping.update(chunk_mapping)
-                logger.info(f"Chunk '{chunk_key}' suggested {len(chunk_mapping)} tag changes")
-                
-            except Exception as e:
-                logger.error(f"Error processing chunk '{chunk_key}': {e}")
-                continue
-        
-        logger.info(f"Combined chunked processing: {len(combined_mapping)} total tag changes suggested")
-        return combined_mapping
-
-    def parse_ai_response(self, response, tags: Set[str]) -> Optional[Dict[str, str]]:
-        """Parse the AI response and extract the tag mapping."""
-        if response.status_code == 200:
-            result = response.json()
-            content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-            
-            try:
-                # Clean the response more thoroughly
-                content = content.strip()
-                
-                # Remove thinking tags if present
-                if '<think>' in content:
-                    # Extract content between </think> and end, or find JSON block
-                    think_end = content.find('</think>')
-                    if think_end != -1:
-                        content = content[think_end + 8:].strip()
-                
-                # Remove code blocks
-                if content.startswith('```json'):
-                    content = content[7:]
-                elif content.startswith('```'):
-                    content = content[3:]
-                if content.endswith('```'):
-                    content = content[:-3]
-                content = content.strip()
-                
-                # Try to find JSON object in the content
-                json_start = content.find('{')
-                json_end = content.rfind('}')
-                if json_start != -1 and json_end != -1 and json_end > json_start:
-                    content = content[json_start:json_end + 1]
-                
-                mapping = json.loads(content)
-                if isinstance(mapping, dict):
-                    return mapping
-                else:
-                    logger.error("AI response is not a valid dictionary")
-                    return None
-                    
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse AI response: {e}")
-                logger.debug(f"Raw content: {content}")
-                return None
-        else:
-            logger.error(f"AI API request failed: {response.status_code} - {response.text}")
-            return None
-
-    def apply_tag_changes(self, input_dir: Path, tag_mapping: Dict[str, str], tag_to_files: Dict[str, Set[str]]) -> Dict[str, int]:
+    def apply_tag_changes(self, input_dir: Path, tag_mapping: Dict[str, str], 
+                         tag_to_files: Dict[str, Set[str]]) -> Dict[str, int]:
         """Apply tag changes to all affected images."""
         logger.info(f"Applying tag changes to images...")
         
@@ -391,100 +472,146 @@ Here are the tags to deduplicate:"""
         }
 
     def save_deduplication_report(self, output_path: Path, tag_mapping: Dict[str, str], 
-                                tag_to_files: Dict[str, Set[str]], results: Dict[str, int]):
+                                tag_to_files: Dict[str, Set[str]], tag_frequencies: Dict[str, int],
+                                results: Dict[str, int]):
         """Save a detailed report of the deduplication process."""
+        # Create detailed cluster information
+        clusters_info: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for old_tag, new_tag in tag_mapping.items():
+            clusters_info[new_tag].append({
+                "old_tag": old_tag,
+                "frequency": tag_frequencies.get(old_tag, 0),
+                "files_affected": len(tag_to_files.get(old_tag, set()))
+            })
+        
         report = {
-            "timestamp": str(Path().cwd()),  # Using current time would be better but this is simpler
+            "configuration": {
+                "embedding_model": self.embedding_model,
+                "similarity_threshold": self.similarity_threshold,
+                "min_cluster_size": self.min_cluster_size,
+                "batch_size": self.batch_size
+            },
             "tag_mapping": tag_mapping,
-            "affected_files_count": {tag: len(files) for tag, files in tag_to_files.items() if tag in tag_mapping},
+            "clusters": {
+                representative_tag: {
+                    "representative_tag": representative_tag,
+                    "merged_tags": cluster_tags,
+                    "total_frequency": sum(tag_info["frequency"] for tag_info in cluster_tags),
+                    "total_files_affected": sum(tag_info["files_affected"] for tag_info in cluster_tags)
+                }
+                for representative_tag, cluster_tags in clusters_info.items()
+            },
             "results": results,
             "summary": {
-                "total_tags_changed": len(tag_mapping),
+                "total_unique_tags_before": len(tag_frequencies),
+                "total_tags_merged": len(tag_mapping),
+                "total_clusters_created": len(clusters_info),
                 "total_files_affected": results.get("total_files_processed", 0),
                 "files_updated_successfully": results.get("files_updated", 0),
-                "files_failed": results.get("files_failed", 0)
+                "files_failed": results.get("files_failed", 0),
+                "embedding_cache_size": len(self.embedding_cache)
             }
         }
         
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(report, f, indent=2, ensure_ascii=False)
+                json.dump(report, f, indent=2, ensure_ascii=False, default=str)
             logger.info(f"Deduplication report saved to: {output_path}")
         except Exception as e:
             logger.error(f"Failed to save report: {e}")
 
     def run_deduplication(self, input_dir: Path, dry_run: bool = False) -> bool:
-        """Run the complete deduplication process."""
-        logger.info("Starting tag deduplication process...")
+        """Run the complete embedding-based deduplication process."""
+        logger.info("Starting embedding-based tag deduplication process...")
         
         # Step 1: Collect all tags
-        tag_to_files, all_tags = self.collect_all_tags(input_dir)
+        tag_to_files, tag_frequencies = self.collect_all_tags(input_dir)
         
-        if not all_tags:
+        if not tag_frequencies:
             logger.warning("No tags found in any images. Nothing to deduplicate.")
             return False
         
-        logger.info(f"Found {len(all_tags)} unique tags across all images")
+        logger.info(f"Found {len(tag_frequencies)} unique tags across all images")
         
-        # Step 2: Get AI deduplication mapping
-        tag_mapping = self.get_ai_deduplication_mapping(all_tags, dry_run)
+        # Step 2: Create embedding-based tag mapping
+        unique_tags = list(tag_frequencies.keys())
+        tag_mapping = self.create_tag_mapping(unique_tags, tag_frequencies)
         
         if not tag_mapping:
-            logger.warning("No tag changes suggested by AI or AI call failed.")
-            return False
-        
-        # Filter out no-op changes where old_tag == new_tag
-        filtered_mapping = {old_tag: new_tag for old_tag, new_tag in tag_mapping.items() if old_tag != new_tag}
-        
-        if not filtered_mapping:
-            logger.info("No duplicate tags found. All tags are already unique.")
+            logger.info("No similar tags found. All tags are already unique.")
             return True
         
-        # Update tag_mapping to use the filtered version
-        tag_mapping = filtered_mapping
-        
         # Display proposed changes
-        logger.info("Proposed tag changes:")
-        for old_tag, new_tag in tag_mapping.items():
+        logger.info("Proposed tag changes based on embedding similarity:")
+        for old_tag, new_tag in sorted(tag_mapping.items()):
             affected_files = len(tag_to_files.get(old_tag, set()))
-            logger.info(f"  '{old_tag}' -> '{new_tag}' (affects {affected_files} files)")
+            old_freq = tag_frequencies.get(old_tag, 0)
+            new_freq = tag_frequencies.get(new_tag, 0)
+            logger.info(f"  '{old_tag}' (freq: {old_freq}) -> '{new_tag}' (freq: {new_freq}) "
+                       f"(affects {affected_files} files)")
         
         if dry_run:
             logger.info("Dry run mode - no changes will be applied")
+            # Still save a report for dry run
+            report_path = input_dir / "tag_deduplication_report_dryrun.json"
+            dummy_results = {"files_updated": 0, "files_failed": 0, "total_files_processed": 0}
+            self.save_deduplication_report(report_path, tag_mapping, tag_to_files, 
+                                         tag_frequencies, dummy_results)
             return True
         
         # Step 3: Apply changes
         results = self.apply_tag_changes(input_dir, tag_mapping, tag_to_files)
         
         # Step 4: Save report
-        report_path = input_dir / "tag_deduplication_report.json"
-        self.save_deduplication_report(report_path, tag_mapping, tag_to_files, results)
+        report_path = input_dir / "tag_deduplication_report_embedding.json"
+        self.save_deduplication_report(report_path, tag_mapping, tag_to_files, 
+                                     tag_frequencies, results)
         
         # Summary
-        logger.info("=== Deduplication Complete ===")
-        logger.info(f"Tags changed: {len(tag_mapping)}")
+        logger.info("=== Embedding-Based Deduplication Complete ===")
+        logger.info(f"Tags merged: {len(tag_mapping)}")
+        logger.info(f"Clusters created: {len(set(tag_mapping.values()))}")
         logger.info(f"Files updated successfully: {results['files_updated']}")
         logger.info(f"Files failed: {results['files_failed']}")
         logger.info(f"Total files processed: {results['total_files_processed']}")
+        logger.info(f"Embeddings cached: {len(self.embedding_cache)}")
         
         return results['files_failed'] == 0
 
 def main():
-    """Main function to run the tag deduplicator."""
-    parser = argparse.ArgumentParser(description="Deduplicate similar tags across images using AI.")
+    """Main function to run the embedding-based tag deduplicator."""
+    parser = argparse.ArgumentParser(
+        description="Deduplicate similar tags across images using text embeddings."
+    )
     parser.add_argument("input_dir", help="Input directory containing images with tags.")
-    parser.add_argument("--api-url", default="http://127.0.0.1:1234", help="AI model API URL.")
-    parser.add_argument("--model", default="qwen/qwen3-8b", help="AI model name for deduplication.")
-    parser.add_argument("--dry-run", action="store_true", help="Show proposed changes without applying them.")
-    parser.add_argument("--chunk", action="store_true", help="Split tags alphabetically into chunks for large datasets (A, B, C, etc.).")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
+    parser.add_argument("--embedding-url", default="http://localhost:1234", 
+                       help="Embedding API URL.")
+    parser.add_argument("--embedding-model", default="text-embedding-nomic-embed-text-v1.5",
+                       help="Embedding model name.")
+    parser.add_argument("--similarity-threshold", type=float, default=0.85,
+                       help="Cosine similarity threshold for grouping tags (0.0-1.0).")
+    parser.add_argument("--min-cluster-size", type=int, default=2,
+                       help="Minimum number of tags required to form a cluster.")
+    parser.add_argument("--batch-size", type=int, default=100,
+                       help="Number of tags to process in each embedding batch.")
+    parser.add_argument("--dry-run", action="store_true", 
+                       help="Show proposed changes without applying them.")
+    parser.add_argument("-v", "--verbose", action="store_true", 
+                       help="Enable verbose logging.")
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         
-    deduplicator = TagDeduplicator(api_url=args.api_url, model=args.model, use_chunking=args.chunk)
+    deduplicator = EmbeddingTagDeduplicator(
+        embedding_api_url=args.embedding_url,
+        embedding_model=args.embedding_model,
+        similarity_threshold=args.similarity_threshold,
+        min_cluster_size=args.min_cluster_size,
+        batch_size=args.batch_size
+    )
+    
     input_path = Path(args.input_dir)
     
     if not input_path.is_dir():
